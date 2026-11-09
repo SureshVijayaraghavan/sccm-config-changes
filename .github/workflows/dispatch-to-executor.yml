@@ -1,0 +1,186 @@
+name: Dispatch change to executor
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'changes/**/*.json'
+  workflow_dispatch:
+    inputs:
+      change_file:
+        description: Path under changes/ to dispatch
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve change files
+        id: resolve
+        env:
+          MANUAL_FILE: ${{ inputs.change_file }}
+        run: |
+          set -euo pipefail
+          files=()
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            files+=("${MANUAL_FILE}")
+          else
+            echo "git rev-parse HEAD     : $(git rev-parse HEAD)"
+            echo "git rev-parse HEAD~1   : $(git rev-parse HEAD~1 2>/dev/null || echo missing)"
+            echo "Changed JSON candidates:"
+            git diff --name-only --diff-filter=AM HEAD~1 HEAD -- changes || true
+
+            while IFS= read -r f; do
+              if [[ "$f" == changes/* ]] && [[ "$f" == *.json ]]; then
+                files+=("$f")
+              fi
+            done < <(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- changes || true)
+
+            if [ ${#files[@]} -gt 0 ]; then
+              mapfile -t files < <(printf '%s\n' "${files[@]}" | awk 'NF && !seen[$0]++')
+            fi
+          fi
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No changed JSON files under changes/ in this push. Not dispatching."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s\n' "${files[@]}" > /tmp/change-files.txt
+          echo "count=${#files[@]}" >> "$GITHUB_OUTPUT"
+          echo "Resolved files:"
+          cat /tmp/change-files.txt
+
+      - name: Validate change JSON syntax and schema
+        if: steps.resolve.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          failed=0
+
+          while IFS= read -r file; do
+            echo "Validating $file"
+
+            if [ ! -f "$file" ]; then
+              echo "::error file=$file::File not found"
+              failed=1
+              continue
+            fi
+
+            if ! jq empty "$file" 2>/tmp/jq-err; then
+              echo "::error file=$file::Invalid JSON syntax: $(tr '\n' ' ' </tmp/jq-err)"
+              failed=1
+              continue
+            fi
+
+            if ! jq -e 'type == "object"' "$file" >/dev/null; then
+              echo "::error file=$file::Root value must be a JSON object"
+              failed=1
+              continue
+            fi
+
+            action=$(jq -r '.action // empty' "$file")
+            objectType=$(jq -r '.objectType // empty' "$file")
+            objectId=$(jq -r '.objectId // empty' "$file")
+            patchType=$(jq -r '.patch | type' "$file")
+
+            case "$action" in
+              updateCollection|updateApplication|updateBaseline) ;;
+              '')
+                echo "::error file=$file::Missing required string field: action"
+                failed=1
+                ;;
+              *)
+                echo "::error file=$file::Unsupported action '$action'"
+                failed=1
+                ;;
+            esac
+
+            case "$objectType" in
+              collection|application|baseline) ;;
+              '')
+                echo "::error file=$file::Missing required string field: objectType"
+                failed=1
+                ;;
+              *)
+                echo "::error file=$file::objectType must be collection, application, or baseline (got '$objectType')"
+                failed=1
+                ;;
+            esac
+
+            if [ -z "$objectId" ]; then
+              echo "::error file=$file::Missing required string field: objectId"
+              failed=1
+            fi
+
+            if [ "$patchType" != "object" ]; then
+              echo "::error file=$file::patch must be a JSON object (got $patchType)"
+              failed=1
+            elif ! jq -e '.patch["@odata.type"] | type == "string" and length > 0' "$file" >/dev/null; then
+              echo "::error file=$file::patch.@odata.type is required and must be a non-empty string"
+              failed=1
+            fi
+
+            echo "Checked: $file"
+          done < /tmp/change-files.txt
+
+          if [ "$failed" -ne 0 ]; then
+            echo "JSON validation failed — private executor will not be triggered." >&2
+            exit 1
+          fi
+
+          echo "All change files passed JSON validation."
+
+      - name: Dispatch each change to private executor
+        if: steps.resolve.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.EXECUTOR_DISPATCH_TOKEN }}
+          EXECUTOR_REPO: ${{ vars.EXECUTOR_REPO }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "Missing secret EXECUTOR_DISPATCH_TOKEN" >&2
+            exit 1
+          fi
+          EXECUTOR_REPO="${EXECUTOR_REPO:-SureshVijayaraghavan/sccm-cicd-poc}"
+
+          while IFS= read -r file; do
+            echo "Processing $file"
+            action=$(jq -r '.action // empty' "$file")
+            objectType=$(jq -r '.objectType' "$file")
+            objectId=$(jq -r '.objectId' "$file")
+            patch=$(jq -c '.patch' "$file")
+
+            if [ -z "$objectId" ] || [ "$objectId" = "REPLACE_WITH_SCCM_COLLECTION_ID" ]; then
+              echo "Skipping $file — set a real allowlisted objectId first."
+              continue
+            fi
+
+            payload=$(jq -n \
+              --arg action "$action" \
+              --arg objectType "$objectType" \
+              --arg objectId "$objectId" \
+              --argjson patch "$patch" \
+              --arg sourceFile "$file" \
+              --arg sourceRepo "$GITHUB_REPOSITORY" \
+              --arg sourceSha "$GITHUB_SHA" \
+              '{action:$action, objectType:$objectType, objectId:$objectId, patch:$patch, sourceFile:$sourceFile, sourceRepo:$sourceRepo, sourceSha:$sourceSha}')
+
+            echo "Dispatching sccm-config-update for objectId=$objectId"
+            jq -n \
+              --arg event_type "sccm-config-update" \
+              --argjson client_payload "$payload" \
+              '{event_type:$event_type, client_payload:$client_payload}' \
+              | gh api --method POST "repos/${EXECUTOR_REPO}/dispatches" --input -
+
+            echo "Dispatched from $file"
+          done < /tmp/change-files.txt

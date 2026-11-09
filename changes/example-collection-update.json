@@ -1,0 +1,10 @@
+{
+  "action": "updateCollection",
+  "objectType": "collection",
+  "objectId": "REPLACE_WITH_SCCM_COLLECTION_ID",
+  "patch": {
+    "@odata.type": "#sccm.pipeline.collectionUpdate",
+    "name": "Example Collection",
+    "comment": "Set a real allowlisted objectId before dispatching"
+  }
+}

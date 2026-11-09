@@ -1,0 +1,12 @@
+{
+  "action": "updateCollection",
+  "objectType": "collection",
+  "objectId": "LAB-COLL-001",
+  "patch": {
+    "@odata.type": "#sccm.pipeline.collectionUpdate",
+    "name": "Lab Pilot Devices",
+    "limitingCollectionId": "SMS00001",
+    "refreshType": "Manual",
+    "comment": "Pipeline logic POC via public sccm-config-changes"
+  }
+}
